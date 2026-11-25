@@ -85,6 +85,9 @@ pub fn run(
         inner: &resolver,
         dlls: &dlls,
     };
+    // The title's movies go through our wrappers of its Bink DLL (logged,
+    // skipped with `VICTORY_SKIP_MOVIES`).
+    let with_dlls = victory_hle::modules::bink::Movies { inner: &with_dlls };
     let show = |name: &str, report: BindReport| {
         println!(
             "bound          {name}: {} hle, {} host, {} title, {} missing",
