@@ -16,8 +16,11 @@ param(
     [switch]$SkipCutscene,
     # Other buttons F8 holds for you in turn, e.g. "A,X" (overrides the above).
     [string]$AutoPress = "",
-    [string]$Exe = "$PSScriptRoot\..\target\release\victory.exe"
+    # Default: target\release\victory.exe beside this script (set below:
+    # $PSScriptRoot is empty while Windows PowerShell 5.1 reads the defaults).
+    [string]$Exe = ""
 )
+if (-not $Exe) { $Exe = Join-Path $PSScriptRoot "..\target\release\victory.exe" }
 foreach ($v in "VICTORY_KEYS", "VICTORY_CAPTURE", "VICTORY_CAPTURE_FRAMES", "VICTORY_DUMP_TARGETS") {
     Remove-Item "Env:$v" -ErrorAction SilentlyContinue
 }
