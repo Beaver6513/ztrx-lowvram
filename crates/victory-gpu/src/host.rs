@@ -481,6 +481,18 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     }
 }
 
+/// The budget the system gave this process on the card when the device was
+/// made, in bytes (0: not known yet). Memory policies scale by it: a card
+/// with 4 GB gets about 3.2 GB, against the title's 2.4 GB of render
+/// targets alone.
+pub(crate) static CARD_BUDGET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether the card's budget is under `bytes` (false while not known).
+pub(crate) fn small_card(bytes: u64) -> bool {
+    let budget = CARD_BUDGET.load(Ordering::Relaxed);
+    budget != 0 && budget < bytes
+}
+
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {
@@ -606,6 +618,13 @@ fn create() -> windows::core::Result<Host> {
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
+        if let Some(adapter) = &adapter {
+            let mut own = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+            if adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut own).is_ok() {
+                CARD_BUDGET.store(own.Budget, Ordering::Relaxed);
+                tracing::info!(budget_mb = own.Budget >> 20, "the card's memory budget for this process");
+            }
+        }
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,

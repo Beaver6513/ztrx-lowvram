@@ -1361,10 +1361,16 @@ pub(crate) fn host_made<'a>(
 /// (`VICTORY_TEXTURE_BUDGET_MB` sets a limit on those copies' bytes
 /// instead). Past the budget the system moves the card's memory into the
 /// PC's, which ended runs 20 and 24.
+///
+/// The floor is 2 GB, or a sixth of the card's budget if that is less: on
+/// a card with 4 GB (3.3 GB of budget) the title's render targets take 2.4
+/// GB, and 2 GB of textures on top kept the card at twice its budget, the
+/// system moving memory to and from the PC's every frame.
 #[cfg(windows)]
 pub(crate) fn room() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
-    const FLOOR: u64 = 2 << 30;
+    let budget = crate::host::CARD_BUDGET.load(Relaxed);
+    let floor: u64 = if budget == 0 { 2 << 30 } else { (budget / 6).min(2 << 30) };
     const WITHOUT_BUDGET: u64 = 4 << 30;
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
@@ -1375,7 +1381,7 @@ pub(crate) fn room() -> bool {
     if let Some(limit) = limit {
         return filled < limit;
     }
-    if filled < FLOOR {
+    if filled < floor {
         return true;
     }
     match crate::host::host().and_then(|h| h.video_memory()) {

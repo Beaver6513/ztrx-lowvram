@@ -134,9 +134,16 @@ struct Card {
 /// ranges declared as written. A write outside them is seen by later
 /// shaders, as before, and goes back to the title the next time a declared
 /// range holds its piece (before: never).
+///
+/// Unless the variable says otherwise, not on a card whose budget is under
+/// 6 GB: there the copies' half a gigabyte pushes the card past its budget
+/// and the system moves memory to and from the PC's every frame (a GTX 1650,
+/// 3.3 GB of budget: the card's part of a frame 503 ms with them, 252 ms
+/// without, the textures capped in both).
 pub(crate) fn cards() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_BUFFERS").is_none_or(|v| v != "0"))
+    static ON: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    let set = *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_BUFFERS").map(|v| v != "0"));
+    set.unwrap_or_else(|| !crate::host::small_card(6 << 30))
 }
 
 /// The smallest title buffer whose copy goes to the card's memory, and the
