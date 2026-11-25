@@ -498,12 +498,15 @@ pub(crate) fn host() -> Option<&'static Host> {
 fn create() -> windows::core::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
+        // The Agility SDK first, when the user supplies one (Windows 10's
+        // own runtime stops at SM 6.5): every D3D12 call after this goes to it.
+        victory_shader::agility::state();
         // The debug layer only in builds with diagnostics.
         let debug =
             cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DEBUG").is_some();
         if debug {
             let mut layer: Option<ID3D12Debug> = None;
-            match D3D12GetDebugInterface(&mut layer) {
+            match victory_shader::agility::debug_interface(&CLSID_D3D12Debug, &mut layer) {
                 Ok(()) => layer.iter().for_each(|l| l.EnableDebugLayer()),
                 Err(e) => tracing::warn!(error = %e, "no D3D12 debug layer"),
             }
@@ -529,7 +532,7 @@ fn create() -> windows::core::Result<Host> {
         // faulting address), read when the device is removed.
         if dred_on() {
             let mut dred: Option<ID3D12DeviceRemovedExtendedDataSettings> = None;
-            if D3D12GetDebugInterface(&mut dred).is_ok()
+            if victory_shader::agility::debug_interface(&CLSID_D3D12DeviceRemovedExtendedData, &mut dred).is_ok()
                 && let Some(dred) = dred
             {
                 dred.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
@@ -542,10 +545,10 @@ fn create() -> windows::core::Result<Host> {
         // address and instruction) instead of a GPU fault and driver reset.
         if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
             let adapter = warp_adapter()?;
-            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            victory_shader::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            victory_shader::agility::create_device(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the
@@ -2757,7 +2760,15 @@ impl Host {
             let mesh = ok
                 && options.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED
                 && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0;
-            tracing::info!(mesh, "host mesh shader support");
+            tracing::info!(
+                mesh,
+                tier = options.MeshShaderTier.0,
+                shader_model = format_args!("{:#x}", model.HighestShaderModel.0),
+                "host mesh shader support"
+            );
+            if !mesh {
+                tracing::warn!("{}", victory_shader::agility::no_sm66_hint());
+            }
             mesh
         })
     }

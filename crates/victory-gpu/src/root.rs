@@ -55,6 +55,9 @@ fn host_export(cache: &OnceLock<Option<usize>>, name: &CStr) -> Option<usize> {
     *cache.get_or_init(|| {
         #[cfg(windows)]
         {
+            // The Agility SDK, when there is one, takes over these exports
+            // (`ApplyToGlobalState`): load it before the first is looked up.
+            victory_shader::agility::state();
             use windows_sys::Win32::System::LibraryLoader::{
                 GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
             };

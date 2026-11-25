@@ -14,7 +14,9 @@ tracing.workspace = true
 anyhow.workspace = true
 victory-formats.workspace = true
 victory-pipeline.workspace = true
-victory-shader.workspace = true
+# `host`: the Agility SDK loader (`victory_shader::agility`) and the
+# shader checks on the host device.
+victory-shader = { workspace = true, features = ["host"] }
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -72,7 +72,7 @@ impl Host {
             // refused pipeline's error then carries.
             if std::env::var_os("VICTORY_D3D12_DEBUG").is_some() {
                 let mut debug: Option<ID3D12Debug> = None;
-                if D3D12GetDebugInterface(&mut debug).is_ok()
+                if crate::agility::debug_interface(&CLSID_D3D12Debug, &mut debug).is_ok()
                     && let Some(debug) = debug
                 {
                     debug.EnableDebugLayer();
@@ -83,9 +83,9 @@ impl Host {
                 let factory: IDXGIFactory4 =
                     CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
                 let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
-                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+                crate::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             } else {
-                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+                crate::agility::create_device(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
                 // A machine without a graphics card gives the software
                 // adapter as its default device (a hosted test runner,
                 // whose first adapter is a display stub that cannot make a
@@ -115,8 +115,9 @@ impl Host {
                 .map_err(err)?;
             if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
                 return Err(format!(
-                    "the device supports SM {:#x} only",
-                    sm.HighestShaderModel.0
+                    "the device supports SM {:#x} only ({})",
+                    sm.HighestShaderModel.0,
+                    crate::agility::no_sm66_hint()
                 ));
             }
             Ok(Host { device })
