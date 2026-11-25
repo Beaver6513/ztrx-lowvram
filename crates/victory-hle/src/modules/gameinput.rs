@@ -36,20 +36,28 @@ const STATUS_CONNECTED: u32 = 0x3;
 const ASYNC_ENUMERATION: u32 = 1;
 
 /// Gamepad buttons; the title maps each bit to one of its pad buttons.
-const MENU: u32 = 0x1;
-const VIEW: u32 = 0x2;
-const A: u32 = 0x4;
-const B: u32 = 0x8;
-const X: u32 = 0x10;
-const Y: u32 = 0x20;
-const UP: u32 = 0x40;
-const DOWN: u32 = 0x80;
-const LEFT: u32 = 0x100;
-const RIGHT: u32 = 0x200;
-const LEFT_SHOULDER: u32 = 0x400;
-const RIGHT_SHOULDER: u32 = 0x800;
-const LEFT_STICK: u32 = 0x1000;
-const RIGHT_STICK: u32 = 0x2000;
+pub(crate) const MENU: u32 = 0x1;
+pub(crate) const VIEW: u32 = 0x2;
+pub(crate) const A: u32 = 0x4;
+pub(crate) const B: u32 = 0x8;
+pub(crate) const X: u32 = 0x10;
+pub(crate) const Y: u32 = 0x20;
+pub(crate) const UP: u32 = 0x40;
+pub(crate) const DOWN: u32 = 0x80;
+pub(crate) const LEFT: u32 = 0x100;
+pub(crate) const RIGHT: u32 = 0x200;
+pub(crate) const LEFT_SHOULDER: u32 = 0x400;
+pub(crate) const RIGHT_SHOULDER: u32 = 0x800;
+pub(crate) const LEFT_STICK: u32 = 0x1000;
+pub(crate) const RIGHT_STICK: u32 = 0x2000;
+
+/// The button bits, for the auto-press (`super::autopress`).
+pub(crate) mod buttons {
+    pub(crate) use super::{
+        A, B, DOWN, LEFT, LEFT_SHOULDER, LEFT_STICK, MENU, RIGHT, RIGHT_SHOULDER, RIGHT_STICK,
+        UP, VIEW, X, Y,
+    };
+}
 
 /// Devices: host pad slots, the keyboard's stand-in pad, the keyboard.
 const PADS: usize = 4;
@@ -325,6 +333,8 @@ struct State {
     pending: Vec<Event>,
     /// Device callbacks running now: token and thread.
     running: Vec<(u64, ThreadId)>,
+    /// Buttons pressed for the player (`VICTORY_AUTO_PRESS`).
+    auto: super::autopress::AutoPress,
 }
 
 pub struct Hub {
@@ -369,6 +379,7 @@ impl Hub {
                 callbacks: Vec::new(),
                 pending: Vec::new(),
                 running: Vec::new(),
+                auto: super::autopress::AutoPress::from_env(),
             }),
             returned: Condvar::new(),
         }));
@@ -449,16 +460,29 @@ impl State {
     fn poll(
         &mut self,
         devices: &[Device; DEVICES],
-        pads: [Option<PadState>; PADS],
-        keys: Vec<KeyState>,
+        mut pads: [Option<PadState>; PADS],
+        mut keys: Vec<KeyState>,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
+        // The auto-press: its toggle key is ours, not the title's; its
+        // buttons go to the first pad, or to the keyboard's stand-in.
+        let toggle = self.auto.key();
+        let toggle_down = keys.iter().any(|k| Some(k.virtual_key) == toggle);
+        keys.retain(|k| Some(k.virtual_key) != toggle);
+        let auto = self.auto.poll(toggle_down, Instant::now());
         let any_pad = pads.iter().any(Option::is_some);
+        if let Some(pad) = pads.iter_mut().flatten().next() {
+            pad.buttons |= auto;
+        }
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!any_pad).then(|| {
+            let mut pad = fallback(&keys);
+            pad.buttons |= auto;
+            Value::Pad(pad)
+        });
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events

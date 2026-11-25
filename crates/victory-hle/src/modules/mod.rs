@@ -11,6 +11,7 @@
 #[cfg(windows)]
 pub mod apu;
 pub mod audio;
+pub mod autopress;
 #[cfg(windows)]
 pub mod bink;
 pub mod d3d12x;
