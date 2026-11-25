@@ -28,6 +28,8 @@ pub mod prepare;
 pub mod resolve;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod stacks;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod writebreak;
 #[cfg(windows)]
 mod threads;
 #[cfg(windows)]
@@ -47,6 +49,8 @@ pub use prepare::{PrepareError, PreparedImage, prepare};
 pub use resolve::{ImportResolver, Provenance, Resolution};
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use stacks::{dump_stacks, dump_stacks_on_schedule};
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use writebreak::break_on_writes;
 #[cfg(windows)]
 pub use threads::disable_thread_calls;
 #[cfg(windows)]
