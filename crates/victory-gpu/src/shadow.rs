@@ -53,6 +53,11 @@ pub(crate) struct Shadow {
     /// hold the copy's bytes as they are now, and whether the snapshot is
     /// counted in [`KEPT_BYTES`].
     kept: Mutex<(Vec<bool>, bool)>,
+    /// With [`still_after`]: per 64 KiB piece, how many compares in a row
+    /// found it as it was before the submission, or [`MOVED`] once one did
+    /// not. A piece compared unchanged that often, and never changed, is
+    /// neither snapshotted nor compared again ([`Shadow::live`]).
+    still: Mutex<Vec<u32>>,
     /// When the copy was last asked for (`crate::host::moment`): a window
     /// outside buffers nothing asked for in a while, and nothing holds, is
     /// let go ([`let_go_idle`]).
@@ -1110,19 +1115,38 @@ fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
 /// not yet done), the 64 KiB pieces that differ from the snapshot, as
 /// [`Shadow::copy_back_with`] takes them; found on several threads.
 pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, usize)>> {
-    let scans = work
-        .iter()
-        .map(|(shadow, address, end)| {
-            let (from, to) = shadow.inside(*address, end.saturating_sub(*address));
-            // The snapshot's memory stays until the range is done with
-            // (`copy_back_done`), which comes after this.
-            match shadow.before.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-                Some(before) => (shadow.data as usize, before.as_ptr() as usize, shadow.start as usize, from, to),
+    // Each work item's runs still watched ([`Shadow::live`]), one scan per
+    // run, and which item each scan is for.
+    let mut owner = Vec::new();
+    let mut runs_of = Vec::with_capacity(work.len());
+    let mut scans = Vec::new();
+    for (i, (shadow, address, end)) in work.iter().enumerate() {
+        let (from, to) = shadow.inside(*address, end.saturating_sub(*address));
+        let runs = shadow.live(from, to, 1);
+        // The snapshot's memory stays until the range is done with
+        // (`copy_back_done`), which comes after this.
+        let before = shadow.before.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|b| b.as_ptr() as usize);
+        for &(a, b) in &runs {
+            owner.push(i);
+            scans.push(match before {
+                Some(before) => (shadow.data as usize, before, shadow.start as usize, a, b),
                 None => (0, 0, 0, 0, 0),
-            }
-        })
-        .collect();
-    find_pieces(scans)
+            });
+        }
+        runs_of.push(runs);
+    }
+    let mut found = vec![Vec::new(); work.len()];
+    for (i, pieces) in owner.into_iter().zip(find_pieces(scans)) {
+        found[i].extend(pieces);
+    }
+    for (((shadow, _, _), pieces), runs) in work.iter().zip(&found).zip(&runs_of) {
+        shadow.note_still(runs, pieces);
+        #[cfg(feature = "diagnostics")]
+        for &(a, b) in runs {
+            compares::note(shadow.start as usize, shadow.len as usize, a, b, pieces);
+        }
+    }
+    found
 }
 
 /// For each of `scans` (where a copy's bytes are, where its snapshot's
@@ -1220,6 +1244,18 @@ static BACK_CLASS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 /// where the card does the search (`VICTORY_CARD_BUFFERS_MIN_MB`); a
 /// window outside buffers cannot as the code stands.
 pub(crate) fn back_line(frames: f64) {
+    #[cfg(feature = "diagnostics")]
+    compares::log();
+    if still_after() > 0 {
+        let [snap, cmp, moved] = [0, 1, 2].map(|i| STILL_SKIPPED[i].swap(0, Ordering::Relaxed) as f64);
+        tracing::info!(
+            "pieces never seen written, left out per frame (VICTORY_SKIP_STATIC): {:.1} MB of snapshots, {:.1} MB of \
+             compares; pieces found changed for the first time: {:.1}",
+            snap / frames / (1 << 20) as f64,
+            cmp / frames / (1 << 20) as f64,
+            moved / frames
+        );
+    }
     let c: Vec<f64> = BACK_CLASS.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     if c.iter().all(|&v| v == 0.0) {
         return;
@@ -1442,6 +1478,38 @@ fn keeps() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_SNAPSHOTS").is_some_and(|v| v == "1"))
 }
+
+/// `VICTORY_SKIP_STATIC=<K>`: a 64 KiB piece of a title buffer's copy that
+/// shaders were declared to write, compared after K submissions in a row
+/// and found unchanged each time, and never found changed, is neither
+/// snapshotted nor compared again. 0 (the default): every piece always is.
+///
+/// What shaders may write is declared by range, and most of it they never
+/// write: on a GeForce GTX 1650, of 434 GB compared in five minutes of
+/// play, 77 % lay in pieces never found changed (a 174 MB buffer compared
+/// twice a frame changed in 0.9 % of its pieces). Once a piece is left out
+/// it stays out, so the state of a piece only ever moves one way and no
+/// compare can meet a snapshot that was not taken. What a shader then does
+/// write there stays in the copy, which later shaders read, but does not
+/// reach title memory. Not for windows outside buffers (memory in more
+/// than one of them is copied once for each) nor with kept snapshots.
+pub(crate) fn still_after() -> u32 {
+    static K: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *K.get_or_init(|| {
+        let k = std::env::var("VICTORY_SKIP_STATIC").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0);
+        if k > 0 {
+            tracing::info!(k, "pieces of title buffers never seen written are left out of the compare (VICTORY_SKIP_STATIC)");
+        }
+        k
+    })
+}
+
+/// [`Shadow::still`]: the piece was found changed once.
+const MOVED: u32 = u32::MAX;
+
+/// Bytes left out of snapshots and compares by [`still_after`] since the
+/// last frame-rate line, and pieces found changed for the first time.
+static STILL_SKIPPED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// Bytes of the snapshots kept, and the most that may be.
 static KEPT_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -1717,6 +1785,7 @@ impl Shadow {
             flights: Mutex::default(),
             before: Mutex::default(),
             kept: Mutex::default(),
+            still: Mutex::default(),
             used: AtomicU64::new(crate::host::moment()),
             asked: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
             unsized_asks: AtomicU64::new(0),
@@ -1855,9 +1924,11 @@ impl Shadow {
             // range is done with (`copy_back_done`).
             let mut snaps = SNAPS.lock().unwrap_or_else(|e| e.into_inner());
             let (data, snapshot) = (self.data as usize, snapshot.as_mut_ptr() as usize);
+            let parts: Vec<_> = parts.into_iter().flat_map(|(from, to)| self.live(from, to, 0)).collect();
             snaps.extend(parts.into_iter().filter(|&(from, to)| from < to).map(|(from, to)| (data + from, snapshot + from, to - from)));
             return;
         }
+        let parts: Vec<_> = parts.into_iter().flat_map(|(from, to)| self.live(from, to, 0)).collect();
         for (from, to) in parts {
             if from < to {
                 // SAFETY: the copy's mapping and the snapshot's allocation
@@ -1907,7 +1978,19 @@ impl Shadow {
             let scanning = std::time::Instant::now();
             let differing = match found {
                 Some(found) => found,
-                None => self.differing(from, to, before),
+                None => {
+                    let runs = self.live(from, to, 1);
+                    let mut found = Vec::new();
+                    for &(a, b) in &runs {
+                        found.extend(self.differing(a, b, &before[a - from..b - from]));
+                    }
+                    self.note_still(&runs, &found);
+                    #[cfg(feature = "diagnostics")]
+                    for &(a, b) in &runs {
+                        compares::note(self.start as usize, self.len as usize, a, b, &found);
+                    }
+                    found
+                }
             };
             #[cfg(feature = "diagnostics")]
             let syncing = {
@@ -2158,6 +2241,75 @@ impl Shadow {
     /// The offsets in the copy that piece `piece` holds.
     fn piece(&self, piece: usize) -> (usize, usize) {
         piece_at(self.start as usize, self.len as usize, piece)
+    }
+
+    /// Whether [`still_after`] applies to this copy.
+    fn still_on(&self) -> bool {
+        still_after() > 0 && !self.window && self.place.is_none() && self.card.is_none() && !keeps()
+    }
+
+    /// Of offsets `[from, to)`, the runs whose pieces are still watched:
+    /// all of it unless [`still_after`] applies. `what` 0 counts what is
+    /// left out as snapshot bytes, 1 as compare bytes.
+    fn live(&self, from: usize, to: usize, what: usize) -> Vec<(usize, usize)> {
+        if from >= to {
+            return Vec::new();
+        }
+        if !self.still_on() {
+            return vec![(from, to)];
+        }
+        let k = still_after();
+        let still = self.still.lock().unwrap_or_else(|e| e.into_inner());
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        let mut left = 0u64;
+        for piece in self.pieces(from, to) {
+            let (lo, hi) = self.piece(piece);
+            let (lo, hi) = (lo.max(from), hi.min(to));
+            let out = still.get(piece).is_some_and(|&n| n != MOVED && n >= k);
+            if out {
+                left += (hi - lo) as u64;
+                continue;
+            }
+            match runs.last_mut() {
+                Some(last) if last.1 == lo => last.1 = hi,
+                _ => runs.push((lo, hi)),
+            }
+        }
+        STILL_SKIPPED[what].fetch_add(left, Ordering::Relaxed);
+        runs
+    }
+
+    /// After offsets `runs` (from [`Shadow::live`]) were compared: `found`
+    /// the pieces that differed, as (offset, bytes) in order.
+    fn note_still(&self, runs: &[(usize, usize)], found: &[(usize, usize)]) {
+        if !self.still_on() {
+            return;
+        }
+        let total = self.len as usize;
+        let mut still = self.still.lock().unwrap_or_else(|e| e.into_inner());
+        if still.is_empty() {
+            *still = vec![0; self.pieces(0, total.max(1)).end];
+        }
+        let mut changed = found.iter().peekable();
+        for &(from, to) in runs {
+            for piece in self.pieces(from, to) {
+                let (lo, hi) = self.piece(piece);
+                let (lo, hi) = (lo.max(from), hi.min(to));
+                while changed.peek().is_some_and(|&&(o, n)| o + n <= lo) {
+                    changed.next();
+                }
+                let differs = changed.peek().is_some_and(|&&(o, _)| o < hi);
+                let Some(n) = still.get_mut(piece) else { continue };
+                if differs {
+                    if *n != MOVED {
+                        STILL_SKIPPED[2].fetch_add(1, Ordering::Relaxed);
+                    }
+                    *n = MOVED;
+                } else if *n != MOVED {
+                    *n = n.saturating_add(1);
+                }
+            }
+        }
     }
 
     /// The copy's bytes at offsets `[from, to)` change: a kept snapshot is
@@ -3190,4 +3342,155 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+/// Measurement (diagnostics builds): how often each 64 KiB piece of title
+/// memory a shader may have written is compared after a submission, and
+/// how often it was found changed, by piece and by copy; and what skipping
+/// a piece after K unchanged compares in a row would have saved and missed.
+#[cfg(feature = "diagnostics")]
+mod compares {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use super::PIECE;
+
+    /// Thresholds of the skipping policy that is simulated.
+    const KS: [u32; 5] = [2, 4, 8, 32, 128];
+
+    #[derive(Default)]
+    struct Piece {
+        compares: u32,
+        changes: u32,
+        /// Unchanged compares in a row up to now.
+        streak: u32,
+    }
+
+    #[derive(Default)]
+    struct Copy {
+        compares: u64,
+        bytes: u64,
+        changed_bytes: u64,
+        pieces_changed: u64,
+    }
+
+    #[derive(Default)]
+    struct Stats {
+        pieces: HashMap<usize, Piece>,
+        copies: HashMap<(usize, usize), Copy>,
+        bytes: u64,
+        changes: u64,
+        /// Per threshold: bytes that would not have been compared, changes
+        /// that would have been missed.
+        skipped: [u64; KS.len()],
+        missed: [u64; KS.len()],
+        logged: Option<std::time::Instant>,
+    }
+
+    static STATS: Mutex<Option<Stats>> = Mutex::new(None);
+
+    /// A copy (title `start`, `len`) had offsets `[from, to)` compared;
+    /// `found` the pieces that differed, as (offset, bytes), in order.
+    pub(super) fn note(start: usize, len: usize, from: usize, to: usize, found: &[(usize, usize)]) {
+        if from >= to {
+            return;
+        }
+        let mut guard = STATS.lock().unwrap_or_else(|e| e.into_inner());
+        let s = guard.get_or_insert_with(Stats::default);
+        let copy = s.copies.entry((start, len)).or_default();
+        copy.compares += 1;
+        let mut changed = found.iter().peekable();
+        let mut at = from;
+        while at < to {
+            let n = (PIECE - (start + at) % PIECE).min(to - at);
+            while changed.peek().is_some_and(|&&(o, m)| o + m <= at) {
+                changed.next();
+            }
+            let differs = changed.peek().is_some_and(|&&(o, _)| o <= at);
+            let piece = s.pieces.entry((start + at) / PIECE).or_default();
+            for (i, &k) in KS.iter().enumerate() {
+                if piece.streak >= k {
+                    s.skipped[i] += n as u64;
+                    if differs {
+                        s.missed[i] += 1;
+                    }
+                }
+            }
+            piece.compares += 1;
+            copy.bytes += n as u64;
+            s.bytes += n as u64;
+            if differs {
+                piece.changes += 1;
+                piece.streak = 0;
+                copy.changed_bytes += n as u64;
+                copy.pieces_changed += 1;
+                s.changes += 1;
+            } else {
+                piece.streak = piece.streak.saturating_add(1);
+            }
+            at += n;
+        }
+    }
+
+    /// Every ten seconds: what has been seen since the start.
+    pub(super) fn log() {
+        let mut guard = STATS.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(s) = guard.as_mut() else { return };
+        let now = std::time::Instant::now();
+        if s.logged.is_some_and(|t| now.duration_since(t).as_secs() < 10) {
+            return;
+        }
+        s.logged = Some(now);
+        let mb = |b: u64| b as f64 / 1e6;
+        // Of the bytes compared: in pieces never found changed, and in
+        // pieces changed in under 1 % of their compares.
+        let (mut never, mut rare, mut total) = (0u64, 0u64, 0u64);
+        for p in s.pieces.values() {
+            let bytes = u64::from(p.compares) * PIECE as u64;
+            total += bytes;
+            if p.changes == 0 {
+                never += bytes;
+            } else if p.changes * 100 < p.compares {
+                rare += bytes;
+            }
+        }
+        tracing::info!(
+            "compares measured since the start: {:.0} MB compared in {} pieces, {} piece compares found a change \
+             ({:.2} % of the bytes); of the bytes compared {:.1} % lie in pieces never found changed, {:.1} % in \
+             pieces changed in under 1 % of their compares",
+            mb(s.bytes),
+            s.pieces.len(),
+            s.changes,
+            100.0 * s.changes as f64 * PIECE as f64 / s.bytes.max(1) as f64,
+            100.0 * never as f64 / total.max(1) as f64,
+            100.0 * rare as f64 / total.max(1) as f64
+        );
+        let policy: Vec<String> = KS
+            .iter()
+            .enumerate()
+            .map(|(i, k)| {
+                format!(
+                    "K={k}: {:.1} % of bytes skipped, {} of {} changes missed ({:.3} %)",
+                    100.0 * s.skipped[i] as f64 / s.bytes.max(1) as f64,
+                    s.missed[i],
+                    s.changes,
+                    100.0 * s.missed[i] as f64 / s.changes.max(1) as f64
+                )
+            })
+            .collect();
+        tracing::info!("compares, skipping a piece after K unchanged compares in a row: {}", policy.join("; "));
+        let mut copies: Vec<_> = s.copies.iter().collect();
+        copies.sort_by_key(|(_, c)| std::cmp::Reverse(c.bytes));
+        for ((start, len), c) in copies.into_iter().take(12) {
+            tracing::info!(
+                "compares by copy: {start:#x}+{len:#x}: {} compares, {:.0} MB compared, {:.1} MB of it in pieces found \
+                 changed ({:.2} %), {} piece changes",
+                c.compares,
+                mb(c.bytes),
+                mb(c.changed_bytes),
+                100.0 * c.changed_bytes as f64 / c.bytes.max(1) as f64,
+                c.pieces_changed
+            );
+        }
+    }
 }
